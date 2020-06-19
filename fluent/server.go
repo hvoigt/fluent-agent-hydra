@@ -26,12 +26,13 @@ package fluent
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"log"
 	"strings"
 	"time"
 
@@ -221,7 +222,7 @@ func decodeRecordSet(tag []byte, entries []interface{}) (FluentRecordSet, error)
 		case time.Time:
 			timestamp = entry[0].(time.Time)
 		default:
-			return FluentRecordSet{}, errors.New("Failed to decode timestamp field")
+			return FluentRecordSet{}, fmt.Errorf("Failed to decode timestamp field: %T, %#v: %T, %#v", entry[0], entry[0], entry[1], entry[1])
 		}
 		// data
 		data, ok := entry[1].(map[string]interface{})
@@ -240,7 +241,75 @@ func decodeRecordSet(tag []byte, entries []interface{}) (FluentRecordSet, error)
 	}, nil
 }
 
-func DecodeEntries(conn net.Conn) ([]FluentRecordSet, error) {
+func decodeCompressed(options map[string]interface{}, reader io.Reader, tag []byte) ([]FluentRecordSet, error) {
+
+	if size, ok := options["size"]; ok && size != 1 {
+		return nil, fmt.Errorf("Multiple gzip streams unsupported (count: %i)", options["size"])
+	}
+
+	gzipReader, err := gzip.NewReader(reader)
+	if err != nil {
+		return nil, errors.New("Failed to decode gzip data")
+	}
+
+	for key, value := range options {
+		log.Printf("option: key: %T, %#v / value: %T, %#v", key, key, value, value)
+	}
+
+	return decodePackedEntries(gzipReader, tag)
+}
+
+func decodePackedEntries(reader io.Reader, tag []byte) ([]FluentRecordSet, error) {
+	entries := make([]interface{}, 0)
+	for {
+		entry := make([]interface{}, 0)
+		err := codec.NewDecoder(reader, &mh).Decode(&entry)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, errors.New("Unexpected payload format")
+		}
+		entries = append(entries, entry)
+	}
+	recordSet, err := decodeRecordSet(tag, entries)
+	if err != nil {
+		return nil, err
+	}
+	return []FluentRecordSet{recordSet}, nil
+}
+
+func decodePackedForwardStr(timestamp_or_entries []byte, tag []byte) ([]FluentRecordSet, error) {
+	reader := strings.NewReader(string(timestamp_or_entries))
+	return decodePackedEntries(reader, tag)
+}
+
+func decodePackedForwardBin(timestamp_or_entries []byte, tag []byte) ([]FluentRecordSet, error) {
+	reader := bytes.NewReader(timestamp_or_entries)
+	return decodePackedEntries(reader, tag)
+}
+
+func decodePackedForward(timestamp_or_entries []byte, v []interface{}, tag []byte) ([]FluentRecordSet, error) {
+
+	reader := bytes.NewReader(timestamp_or_entries)
+	if options, ok := v[2].(map[string]interface{}); ok {
+		if compressed, ok := options["compressed"]; ok {
+			value, ok := compressed.([]byte)
+			if !ok {
+				return nil, fmt.Errorf("Could not determine compression for tag '%s'", string(tag))
+			}
+			if bytes.Equal(value, []byte("text")) {
+				return decodePackedForwardStr(timestamp_or_entries, tag)
+			}
+			if bytes.Equal(value, []byte("gzip")) {
+				return decodeCompressed(options, reader, tag)
+			}
+			return nil, fmt.Errorf("Compression '%s' for tag '%s' not supported", string(value), string(tag))
+		}
+	}
+	return decodePackedForwardBin(timestamp_or_entries, tag)
+}
+
+func DecodeEntries(conn io.Reader) ([]FluentRecordSet, error) {
 	dec := codec.NewDecoder(conn, &mh)
 	v := []interface{}{nil, nil, nil}
 	err := dec.Decode(&v)
@@ -294,29 +363,15 @@ func DecodeEntries(conn net.Conn) ([]FluentRecordSet, error) {
 		if !ok {
 			return nil, errors.New("Unexpected payload format")
 		}
+		log.Printf("Forward packet")
 		recordSet, err := decodeRecordSet(tag, timestamp_or_entries)
 		if err != nil {
 			return nil, err
 		}
 		retval = []FluentRecordSet{recordSet}
 	case []byte: // PackedForward
-		reader := bytes.NewReader(timestamp_or_entries)
-		entries := make([]interface{}, 0)
-		for {
-			entry := make([]interface{}, 0)
-			err := codec.NewDecoder(reader, &mh).Decode(&entry)
-			if err == io.EOF {
-				break
-			} else if err != nil {
-				return nil, errors.New("Unexpected payload format")
-			}
-			entries = append(entries, entry)
-		}
-		recordSet, err := decodeRecordSet(tag, entries)
-		if err != nil {
-			return nil, err
-		}
-		retval = []FluentRecordSet{recordSet}
+
+		return decodePackedForward(timestamp_or_entries, v, tag)
 	default:
 		return nil, errors.New(fmt.Sprintf("Unknown type: %t", timestamp_or_entries))
 	}

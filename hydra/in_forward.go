@@ -115,6 +115,12 @@ func (f *InForward) handleConn(conn net.Conn, c *Context) {
 			conn.Close()
 			return
 		}
+		for _, recordSet := range recordSets {
+			log.Println("[tag] %s", recordSet.Tag)
+		}
+
+		return
+
 		m := int64(0)
 		d := int64(0)
 		for _, recordSet := range recordSets {
